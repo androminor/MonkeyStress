@@ -1,0 +1,348 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Monkey Stress — Single Page Game</title>
+  <style>
+    :root{ --accent:#ffcc33; --bg1:#87CEEB; --bg2:#a2d5f2 }
+    html,body{height:100%;margin:0;font-family:Inter,Arial,Helvetica,sans-serif;background:linear-gradient(var(--bg1),var(--bg2));}
+    #gameWrap{position:fixed;inset:0;display:flex;align-items:center;justify-content:center}
+    canvas{display:block;width:100%;height:100%;background:transparent}
+    .hud{position:absolute;left:16px;top:12px;color:#1b2b34;text-shadow:0 1px 0 rgba(255,255,255,0.6);font-weight:700}
+    .hud .score{font-size:20px}
+    .top-right{position:absolute;right:16px;top:12px;text-align:right}
+    .center-overlay{position:absolute;left:50%;top:48%;transform:translate(-50%,-50%);text-align:center}
+    .btn{display:inline-block;background:#1b2b34;color:white;padding:10px 16px;border-radius:12px;cursor:pointer;margin-top:12px;user-select:none}
+    .mutebtn{background:transparent;border:2px solid rgba(27,43,52,0.15);color:#1b2b34;padding:6px 10px;border-radius:8px}
+    .small{font-size:13px;opacity:0.9}
+    /* make overlays ignore pointer events except their children */
+    .overlay{pointer-events:none}
+    .overlay *{pointer-events:auto}
+    @media (max-width:600px){ .hud .score{font-size:18px} .btn{padding:10px 14px} }
+  </style>
+</head>
+<body>
+  <div id="gameWrap">
+    <canvas id="gameCanvas" role="img" aria-label="Monkey Stress Game"></canvas>
+
+    <div class="hud overlay">
+      <div class="score">Score: <span id="score">0</span></div>
+      <div class="small">High: <span id="high">0</span></div>
+    </div>
+
+    <div class="top-right overlay">
+      <div class="small">Tap / Click / Space to flap</div>
+      <div style="margin-top:8px"><button id="mute" class="mutebtn">Mute</button></div>
+    </div>
+
+    <div class="center-overlay overlay" id="startScreen">
+      <h1 style="margin:0;font-size:28px;color:#1b2b34">Monkey Stress</h1>
+      <p class="small" style="margin:8px 0 0">Fly the monkey. Avoid obstacles. Speed increases over time.</p>
+      <div class="btn" id="startBtn">Play</div>
+    </div>
+
+    <div class="center-overlay overlay" id="gameOverScreen" style="display:none">
+      <h2 style="margin:0;font-size:26px;color:#b31b34">Game Over</h2>
+      <p class="small" id="finalScore" style="margin:8px 0 0">You scored 0</p>
+      <div class="btn" id="retryBtn">Retry</div>
+    </div>
+
+  </div>
+
+<script>
+// Single-file Monkey Stress game
+// Controls: Click / Tap / Space => flap
+// Features: parallax background, increasing speed, localStorage highscore, retry, collision sound
+
+(() => {
+  const canvas = document.getElementById('gameCanvas');
+  const ctx = canvas.getContext('2d');
+  const scoreEl = document.getElementById('score');
+  const highEl = document.getElementById('high');
+  const startScreen = document.getElementById('startScreen');
+  const startBtn = document.getElementById('startBtn');
+  const gameOverScreen = document.getElementById('gameOverScreen');
+  const retryBtn = document.getElementById('retryBtn');
+  const finalScore = document.getElementById('finalScore');
+  const muteBtn = document.getElementById('mute');
+
+  let DPR = Math.max(1, window.devicePixelRatio || 1);
+  function resize(){
+    DPR = Math.max(1, window.devicePixelRatio || 1);
+    canvas.width = Math.floor(window.innerWidth * DPR);
+    canvas.height = Math.floor(window.innerHeight * DPR);
+    canvas.style.width = window.innerWidth + 'px';
+    canvas.style.height = window.innerHeight + 'px';
+    ctx.setTransform(DPR,0,0,DPR,0,0);
+  }
+  window.addEventListener('resize', resize);
+  resize();
+
+  // Audio using WebAudio
+  const audioCtx = (window.AudioContext || window.webkitAudioContext) ? new (window.AudioContext || window.webkitAudioContext)() : null;
+  let muted = false;
+  muteBtn.addEventListener('click', ()=>{ muted = !muted; muteBtn.textContent = muted ? 'Unmute' : 'Mute'; });
+
+  function playFlap(){
+    if(!audioCtx || muted) return;
+    const o = audioCtx.createOscillator();
+    const g = audioCtx.createGain();
+    o.type = 'sine'; o.frequency.value = 900;
+    g.gain.value = 0.05;
+    o.connect(g); g.connect(audioCtx.destination);
+    o.start(); o.stop(audioCtx.currentTime + 0.06);
+  }
+  function playCollision(){
+    if(!audioCtx || muted) return;
+    const o = audioCtx.createOscillator();
+    const g = audioCtx.createGain();
+    o.type = 'triangle'; o.frequency.value = 120;
+    g.gain.value = 0.2;
+    o.connect(g); g.connect(audioCtx.destination);
+    o.start();
+    o.frequency.exponentialRampToValueAtTime(30, audioCtx.currentTime + 0.3);
+    g.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.35);
+    o.stop(audioCtx.currentTime + 0.36);
+  }
+
+  // Game state
+  let state = 'idle'; // 'idle' | 'playing' | 'over'
+  const gravity = 900; // px/s^2
+  const flapImpulse = -320; // px/s
+
+  const monkey = { x: 140, y: 200, r: 26, vy:0, rotation:0 };
+
+  let obstacles = [];
+  let spawnTimer = 0;
+  const spawnInterval = 1.35; // seconds base
+  let obstacleSpeed = 160; // base px/s
+  let bgBaseSpeed = 20;
+
+  let last = performance.now()/1000;
+  let score = 0;
+  let highscore = parseInt(localStorage.getItem('monkey_high') || '0',10) || 0;
+  highEl.textContent = highscore;
+
+  function reset(){
+    monkey.y = canvas.height / DPR * 0.4;
+    monkey.vy = 0;
+    obstacles = [];
+    spawnTimer = 0;
+    obstacleSpeed = 160;
+    score = 0;
+    bgOffset = 0;
+    last = performance.now()/1000;
+    state = 'playing';
+    startScreen.style.display = 'none';
+    gameOverScreen.style.display = 'none';
+  }
+
+  // Parallax layers state
+  let bgOffset = 0;
+
+  // Input
+  function flap(){
+    if(state !== 'playing') return;
+    monkey.vy = flapImpulse;
+    playFlap();
+  }
+  window.addEventListener('keydown', (e)=>{ if(e.code === 'Space'){ e.preventDefault(); if(state==='idle'){ startBtn.click(); } flap(); } });
+  window.addEventListener('pointerdown', (e)=>{ if(state==='idle'){ startBtn.click(); } flap(); });
+  window.addEventListener('touchstart', (e)=>{ if(state==='idle'){ startBtn.click(); } flap(); }, {passive:true});
+
+  startBtn.addEventListener('click', ()=>{ if(audioCtx && audioCtx.state === 'suspended') audioCtx.resume(); reset(); });
+
+  retryBtn.addEventListener('click', ()=>{ reset(); });
+
+  function spawnObstacle(){
+    const gap = 140 + Math.max(0, Math.min(140, Math.floor(score/5)*8)); // gap shrinks slowly as score rises
+    const minY = 80; const maxY = canvas.height/DPR - 80 - gap;
+    const gapY = minY + Math.random() * (Math.max(minY, maxY) - minY);
+    obstacles.push({ x: canvas.width/DPR + 80, gapY, gap, passed:false, w: 72 + Math.random()*20 });
+  }
+
+  function update(dt){
+    if(state !== 'playing') return;
+
+    // difficulty ramps: obstacle speed increases slightly with score and time
+    obstacleSpeed += dt * 2.2; // steady increase
+    bgBaseSpeed = 18 + Math.min(80, obstacleSpeed * 0.06);
+
+    spawnTimer += dt;
+    const interval = Math.max(0.75, spawnInterval - Math.min(0.6, score * 0.02));
+    if(spawnTimer > interval){ spawnTimer = 0; spawnObstacle(); }
+
+    // update monkey physics
+    monkey.vy += gravity * dt;
+    monkey.y += monkey.vy * dt;
+    monkey.rotation = Math.max(-0.8, Math.min(1.2, monkey.vy / 600));
+
+    // move obstacles
+    for(let ob of obstacles){ ob.x -= obstacleSpeed * dt; }
+    // remove offscreen
+    obstacles = obstacles.filter(ob => ob.x + ob.w > -40);
+
+    // scoring: when monkey passes obstacle
+    for(let ob of obstacles){ if(!ob.passed && ob.x + ob.w/2 < monkey.x){ ob.passed = true; score += 1; scoreEl.textContent = score; if(score % 5 === 0) obstacleSpeed += 12; } }
+
+    // ground and ceiling collision
+    if(monkey.y - monkey.r < 0 || monkey.y + monkey.r > canvas.height/DPR){ endGame(); }
+
+    // obstacle collision
+    for(let ob of obstacles){
+      // top rect: x..x+w, y:0..gapY
+      // bottom rect: x..x+w, y:gapY+gap..h
+      if(circleRectCollision(monkey.x, monkey.y, monkey.r, ob.x, 0, ob.w, ob.gapY) ||
+         circleRectCollision(monkey.x, monkey.y, monkey.r, ob.x, ob.gapY + ob.gap, ob.w, canvas.height/DPR - (ob.gapY + ob.gap))){
+        endGame();
+      }
+    }
+  }
+
+  function endGame(){
+    if(state === 'over') return;
+    state = 'over';
+    playCollision();
+    finalScore.textContent = `You scored ${score}`;
+    gameOverScreen.style.display = 'block';
+    // update highscore
+    if(score > highscore){ highscore = score; localStorage.setItem('monkey_high', String(highscore)); highEl.textContent = highscore; }
+  }
+
+  // basic collision: circle vs rect
+  function circleRectCollision(cx,cy,r, rx, ry, rw, rh){
+    const closestX = clamp(cx, rx, rx + rw);
+    const closestY = clamp(cy, ry, ry + rh);
+    const dx = cx - closestX;
+    const dy = cy - closestY;
+    return (dx*dx + dy*dy) < (r*r);
+  }
+  function clamp(v,a,b){ return Math.max(a, Math.min(b, v)); }
+
+  // draw functions
+  function draw(){
+    // clear
+    ctx.clearRect(0,0,canvas.width/DPR, canvas.height/DPR);
+
+    // draw parallax background: sky bands, distant hills, trees/clouds
+    drawBackground();
+
+    // draw obstacles (cartoony pipes/bananas)
+    for(let ob of obstacles){ drawObstacle(ob); }
+
+    // draw monkey
+    drawMonkey(monkey.x, monkey.y, monkey.r, monkey.rotation);
+
+    // optional: HUD on canvas if needed
+  }
+
+  function drawBackground(){
+    const w = canvas.width/DPR, h = canvas.height/DPR;
+    bgOffset += (bgBaseSpeed + obstacleSpeed*0.02) / 60;
+
+    // distant hills
+    const hillY = h*0.8;
+    for(let i=0;i<3;i++){
+      const amp = 20 + i*30;
+      ctx.fillStyle = i===0 ? '#dff3d3' : (i===1 ? '#c8efc8' : '#b0e9b0');
+      ctx.beginPath();
+      const offset = (bgOffset * (0.3 + i*0.2) + i*200) % (w*1.5);
+      ctx.moveTo(-w, hillY);
+      for(let x=-w;x<=w*2;x+=30){
+        const y = hillY - Math.sin((x+offset)/130) * amp - (i*15);
+        ctx.lineTo(x, y);
+      }
+      ctx.lineTo(w*2, h); ctx.lineTo(-w, h); ctx.closePath(); ctx.fill();
+    }
+
+    // clouds layer
+    const cloudSpeed = bgBaseSpeed * 0.6;
+    const cloudCount = Math.max(3, Math.round(w/300));
+    for(let i=0;i<cloudCount;i++){
+      const cx = ((i*230) + (bgOffset*0.8) * (i%2?1.2:0.7)) % (w + 200) - 120;
+      const cy = 60 + (i%3)*40 + Math.sin((i*30+bgOffset)/40)*12;
+      drawCloud(cx, cy, 80 + (i%3)*20);
+    }
+
+    // foreground grass strip
+    ctx.fillStyle = '#6fc26f';
+    ctx.fillRect(0, h*0.92, w, h*0.08);
+  }
+
+  function drawCloud(x,y,size){
+    ctx.beginPath();
+    ctx.fillStyle = 'rgba(255,255,255,0.95)';
+    ctx.arc(x,y,size*0.4,0,Math.PI*2);
+    ctx.arc(x+size*0.3,y+size*0.05,size*0.35,0,Math.PI*2);
+    ctx.arc(x-size*0.35,y+size*0.03,size*0.3,0,Math.PI*2);
+    ctx.fill();
+  }
+
+  function drawObstacle(ob){
+    const x = ob.x, w = ob.w, gapY = ob.gapY, gap = ob.gap;
+    // top
+    ctx.fillStyle = '#ff9f43';
+    roundRect(ctx, x, -2, w, gapY+2, 12);
+    // bottom
+    ctx.fillStyle = '#ff7f50';
+    roundRect(ctx, x, gapY+gap-2, w, canvas.height/DPR - (gapY+gap) + 4, 12);
+
+    // cartoon eyes on obstacle for character
+    ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.ellipse(x + w*0.5 - 14, gapY - 18, 8, 6, 0, 0, Math.PI*2); ctx.fill();
+    ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.ellipse(x + w*0.5 + 14, gapY - 18, 8, 6, 0, 0, Math.PI*2); ctx.fill();
+    ctx.fillStyle = '#000'; ctx.beginPath(); ctx.ellipse(x + w*0.5 - 14, gapY - 18, 3, 3, 0, 0, Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.ellipse(x + w*0.5 + 14, gapY - 18, 3, 3, 0, 0, Math.PI*2); ctx.fill();
+  }
+
+  function roundRect(ctx, x, y, w, h, r){
+    const maxR = Math.min(r, w/2, h/2);
+    ctx.beginPath(); ctx.moveTo(x+maxR,y);
+    ctx.arcTo(x+w,y,x+w,y+h,maxR); ctx.arcTo(x+w,y+h,x,y+h,maxR);
+    ctx.arcTo(x,y+h,x,y,maxR); ctx.arcTo(x,y,x+w,y,maxR); ctx.closePath(); ctx.fill();
+  }
+
+  function drawMonkey(x,y,r,rot){
+    ctx.save(); ctx.translate(x,y); ctx.rotate(rot);
+    // body shadow
+    ctx.beginPath(); ctx.ellipse(0,r*0.5, r*0.9, r*0.5, 0, 0, Math.PI*2); ctx.fillStyle = 'rgba(0,0,0,0.07)'; ctx.fill();
+
+    // body
+    ctx.beginPath(); ctx.fillStyle = '#e8b56f'; ctx.ellipse(0, 6, r*0.9, r*0.85, 0, 0, Math.PI*2); ctx.fill();
+    // face
+    ctx.beginPath(); ctx.fillStyle = '#ffd89f'; ctx.arc(0, -6, r*0.55, 0, Math.PI*2); ctx.fill();
+    // eyes
+    ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.ellipse(-8, -8, 6, 4, 0,0,Math.PI*2); ctx.fill(); ctx.beginPath(); ctx.ellipse(8, -8, 6, 4, 0,0,Math.PI*2); ctx.fill();
+    ctx.fillStyle = '#000'; ctx.beginPath(); ctx.arc(-8, -8, 2.5,0,Math.PI*2); ctx.fill(); ctx.beginPath(); ctx.arc(8, -8, 2.5,0,Math.PI*2); ctx.fill();
+    // smile
+    ctx.beginPath(); ctx.strokeStyle = '#8b5a2b'; ctx.lineWidth = 2; ctx.arc(0,-2,8,0.1,Math.PI-0.1); ctx.stroke();
+    // ears
+    ctx.beginPath(); ctx.fillStyle = '#e8b56f'; ctx.arc(-18, -4, 7, 0, Math.PI*2); ctx.fill(); ctx.beginPath(); ctx.fillStyle = '#ffd89f'; ctx.arc(-18,-4,4,0,Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.fillStyle = '#e8b56f'; ctx.arc(18, -4, 7, 0, Math.PI*2); ctx.fill(); ctx.beginPath(); ctx.fillStyle = '#ffd89f'; ctx.arc(18,-4,4,0,Math.PI*2); ctx.fill();
+    // tail (simple)
+    ctx.beginPath(); ctx.strokeStyle = '#d99a5a'; ctx.lineWidth = 4; ctx.moveTo(-r*0.7, r*0.2); ctx.quadraticCurveTo(-r*1.2, r*0.3, -r*1.6, r*0.1); ctx.stroke();
+    ctx.restore();
+  }
+
+  // main loop
+  function loop(){
+    const now = performance.now()/1000;
+    const dt = Math.min(0.033, now - last);
+    last = now;
+    if(state === 'playing') update(dt);
+    draw();
+    requestAnimationFrame(loop);
+  }
+  loop();
+
+  // show idle instructions
+  function showIdle(){ startScreen.style.display = 'block'; gameOverScreen.style.display='none'; }
+  showIdle();
+
+  // helper: ensure canvas is sized initially
+  resize();
+
+})();
+</script>
+</body>
+</html>
